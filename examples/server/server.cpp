@@ -125,12 +125,12 @@ int main(int argc, char **argv) {
         res.set_content(default_content.c_str(), default_content.size(), "text/html");
         return false; });
 
-    svr.Post("/bark", [&](const Request &req, Response &res) {
+    svr.Post("/v1/audio/speech", [&](const Request &req, Response &res) {
         // aquire bark model mutex lock
         bark_mutex.lock();
 
         json jreq = json::parse(req.body);
-        std::string text = jreq.at("text");
+        std::string text = jreq.at("input");
 
         std::string dest_wav_path = "/tmp/bark_tmp.wav";
         
