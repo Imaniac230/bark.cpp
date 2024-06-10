@@ -9,6 +9,7 @@
 #include "bark.h"
 #include "httplib.h"
 #include "json.hpp"
+#include "common.h"
 
 #if defined(_MSC_VER)
 #pragma warning(disable : 4244 4267)  // possible loss of data
@@ -27,61 +28,48 @@ struct server_params {
     int32_t port = 1337;
     int32_t read_timeout = 600;
     int32_t write_timeout = 600;
+
+    bark_params bparams;
 };
 
-struct bark_params {
-    int32_t n_threads = std::min(1, static_cast<int32_t>(std::thread::hardware_concurrency()));
-
-    // user prompt
-    std::string prompt = "this is an audio";
-
-    // paths
-    std::string model_path = "./ggml_weights";
-
-    int32_t seed = 0;
-    server_params sparams;
-};
-
-void bark_print_usage(char **argv, const bark_params &params) {
+void bark_print_server_usage(char **argv, const server_params &params) {
     fprintf(stderr, "usage: %s [options]\n", argv[0]);
     fprintf(stderr, "\n");
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -h, --help              show this help message and exit\n");
     fprintf(stderr, "  -m MODEL, --model MODEL path to model\n");
-    fprintf(stderr, "  -t N, --threads N       number of threads to use during computation (default: %d)\n", params.n_threads);
+    fprintf(stderr, "  -t N, --threads N       number of threads to use during computation (default: %d)\n", params.bparams.n_threads);
     fprintf(stderr, "  -p PORT, --port PORT    port number\n");
     fprintf(stderr, "  -a IP, --adress IP      ip adress\n");
     fprintf(stderr, "\n");
 }
 
-void bark_params_parse(int argc, char **argv, bark_params &params) {
+void server_params_parse(int argc, char **argv, server_params &params) {
     bool model_req = false;
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-t" || arg == "--threads") {
-            params.n_threads = std::stoi(argv[++i]);
+          params.bparams.n_threads = std::stoi(argv[++i]);
         } else if (arg == "-m" || arg == "--model") {
-            params.model_path = argv[++i];
-            model_req = true;
-        } else if (arg == "-t" || arg == "--thread") {
-            params.n_threads = std::stoi(argv[++i]);
+          params.bparams.model_path = argv[++i];
+          model_req = true;
         } else if (arg == "-p" || arg == "--port") {
-            params.sparams.port = std::stoi(argv[++i]);
+          params.port = std::stoi(argv[++i]);
         } else if (arg == "-a" || arg == "--address") {
-            params.sparams.hostname = argv[++i];
+          params.hostname = argv[++i];
         } else if (arg == "-h" || arg == "--help") {
-            bark_print_usage(argv, params);
-            exit(0);
+          bark_print_server_usage(argv, params);
+          exit(0);
         } else {
-            fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
-            bark_print_usage(argv, params);
-            exit(1);
+          fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
+          bark_print_server_usage(argv, params);
+          exit(1);
         }
     }
     if (!model_req) {
-        fprintf(stderr, "error: no model path specified\n");
-        bark_print_usage(argv, params);
-        exit(1);
+      fprintf(stderr, "error: no model path specified\n");
+      bark_print_server_usage(argv, params);
+      exit(1);
     }
 }
 
@@ -89,15 +77,15 @@ int main(int argc, char **argv) {
     ggml_time_init();
     const int64_t t_main_start_us = ggml_time_us();
 
-    bark_params params;
+    server_params params;
     bark_verbosity_level verbosity = bark_verbosity_level::LOW;
 
-    bark_params_parse(argc, argv, params);
+    server_params_parse(argc, argv, params);
 
     struct bark_context_params ctx_params = bark_context_default_params();
     ctx_params.verbosity = verbosity;
 
-    struct bark_context *bctx = bark_load_model(params.model_path.c_str(), ctx_params, params.seed);
+    struct bark_context *bctx = bark_load_model(params.bparams.model_path.c_str(), ctx_params, params.bparams.seed);
     if (!bctx) {
         fprintf(stderr, "%s: Could not load model\n", __func__);
         return 1;
@@ -117,19 +105,26 @@ int main(int argc, char **argv) {
         return false;
     });
 
-    svr.Post("/bark", [&](const Request &req, Response &res) {
+    svr.Post("/v1/audio/speech", [&](const Request &req, Response &res) {
         // aquire bark model mutex lock
         bark_mutex.lock();
 
         json jreq = json::parse(req.body);
-        std::string text = jreq.at("text");
+        std::string text = jreq.at("input");
 
         // generate audio
         std::string dest_wav_path = "/tmp/bark_tmp.wav";
-        bark_generate_audio(bctx, text.c_str(), params.n_threads);
+        if (bark_generate_audio(bctx, text.c_str(), params.bparams.n_threads)) {
+          const float *audio_data = bark_get_audio_data(bctx);
+          if (audio_data != NULL) {
+            const int audio_arr_size = bark_get_audio_data_size(bctx);
+            std::vector<float> audio_arr(audio_data, audio_data + audio_arr_size);
+            write_wav_on_disk(audio_arr, dest_wav_path);
+          }
+        }
 
         // read audio as binary
-        std::ifstream wav_file("/tmp/bark_tmp.wav", std::ios::binary);
+        std::ifstream wav_file(dest_wav_path, std::ios::binary);
 
         if (wav_file.is_open()) {
             // Read the contents of the WAV file
@@ -154,21 +149,21 @@ int main(int argc, char **argv) {
         bark_mutex.unlock();
     });
 
-    svr.set_read_timeout(params.sparams.read_timeout);
-    svr.set_write_timeout(params.sparams.write_timeout);
+    svr.set_read_timeout(params.read_timeout);
+    svr.set_write_timeout(params.write_timeout);
 
-    if (!svr.bind_to_port(params.sparams.hostname, params.sparams.port)) {
+    if (!svr.bind_to_port(params.hostname, params.port)) {
         fprintf(stderr, "\ncouldn't bind to server socket: hostname=%s port=%d\n\n",
-                params.sparams.hostname.c_str(), params.sparams.port);
+                params.hostname.c_str(), params.port);
         return 1;
     }
 
     // Set the base directory for serving static files
-    svr.set_base_dir(params.sparams.public_path);
+    svr.set_base_dir(params.public_path);
 
     // to make it ctrl+clickable:
     printf("\nbark server listening at http://%s:%d\n\n",
-           params.sparams.hostname.c_str(), params.sparams.port);
+           params.hostname.c_str(), params.port);
 
     if (!svr.listen_after_bind()) {
         return 1;
